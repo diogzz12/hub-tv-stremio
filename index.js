@@ -48,22 +48,12 @@ const ADDONS_ORIGEM = [
   }
 ];
 
-const CATEGORIAS_PRIORITARIAS = [
-  "Filmes",
-  "Séries",
-  "Variedades",
-  "Esportes",
-  "Notícias"
-];
-
 const MAPA_CATEGORIAS = {
-  // Filmes
   "filme": "Filmes",
   "filmes": "Filmes",
   "movie": "Filmes",
   "movies": "Filmes",
   "cinema": "Filmes",
-  // Séries
   "serie": "Séries",
   "séries": "Séries",
   "series": "Séries",
@@ -71,7 +61,6 @@ const MAPA_CATEGORIAS = {
   "shows": "Séries",
   "novela": "Séries",
   "novelas": "Séries",
-  // Esportes
   "esporte": "Esportes",
   "esportes": "Esportes",
   "futebol": "Esportes",
@@ -79,18 +68,17 @@ const MAPA_CATEGORIAS = {
   "sports": "Esportes",
   "ppv": "Esportes",
   "premiere": "Esportes",
-  // Notícias
   "noticia": "Notícias",
   "notícias": "Notícias",
   "noticias": "Notícias",
   "news": "Notícias",
   "jornalismo": "Notícias",
-  // Variedades e outros
   "variedades": "Variedades",
   "entretenimento": "Variedades",
   "variety": "Variedades",
   "geral": "Variedades",
   "aberta": "Variedades",
+  "canais abertos": "Canais Abertos",
   "tv": "Variedades",
   "canais": "Variedades",
   "infantil": "Infantil",
@@ -108,14 +96,14 @@ const MAPA_CATEGORIAS = {
 
 const indiceOrigem = new Map();
 let cacheAgregado = { timestamp: 0, itens: [], categorias: [] };
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
+const CACHE_TTL_MS = 3 * 60 * 1000;
 
-// Constrói URLs do Stremio preservando prefixos e query string do manifestUrl
-function construirUrlRecurso(manifestUrl, caminhoRecurso) {
+function construirUrlRecurso(manifestUrl, caminhoRecurso, extraSegment = "") {
   const parsed = new URL(manifestUrl);
   const basePath = parsed.pathname.replace(/\/manifest\.json\/?$/i, "").replace(/\/+$/, "");
-  const cleanRecurso = caminhoRecurso.replace(/^\/+/, "");
-  parsed.pathname = `${basePath}/${cleanRecurso}`.replace(/\/{2,}/g, "/");
+  const cleanRecurso = caminhoRecurso.replace(/^\/+/, "").replace(/\.json$/i, "");
+  const sufixoExtra = extraSegment ? `/${extraSegment.replace(/^\/+/, "")}` : "";
+  parsed.pathname = `${basePath}/${cleanRecurso}${sufixoExtra}.json`.replace(/\/{2,}/g, "/");
   return parsed.toString();
 }
 
@@ -154,14 +142,14 @@ function extrairCategoriasItem(meta, cat, addon) {
   return Array.from(encontradas);
 }
 
-async function fetchJsonSeguro(url) {
+async function fetchJsonSeguro(url, timeoutMs = 15000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 9000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
       headers: {
-        "User-Agent": "Mozilla/5.0 Stremio-Hub-Agregador/1.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Stremio/4.4"
       }
     });
     if (!res.ok) return null;
@@ -173,6 +161,26 @@ async function fetchJsonSeguro(url) {
   }
 }
 
+async function buscarMetasCatalogo(addon, cat) {
+  const catType = cat.type || "tv";
+  const catId = encodeURIComponent(cat.id);
+
+  const urlPadrao = construirUrlRecurso(addon.manifestUrl, `catalog/${catType}/${catId}`);
+  let data = await fetchJsonSeguro(urlPadrao);
+
+  if (!data || !Array.isArray(data.metas) || data.metas.length === 0) {
+    const urlComSkip = construirUrlRecurso(addon.manifestUrl, `catalog/${catType}/${catId}`, "skip=0");
+    const dataSkip = await fetchJsonSeguro(urlComSkip);
+    if (dataSkip && Array.isArray(dataSkip.metas) && dataSkip.metas.length > 0) {
+      data = dataSkip;
+    }
+  }
+
+  const metas = data && Array.isArray(data.metas) ? data.metas : [];
+  console.log(`[Hub] ${addon.nome} (${cat.id}): ${metas.length} itens`);
+  return { catType, metas };
+}
+
 async function carregarTudo() {
   const agora = Date.now();
   if (cacheAgregado.itens.length > 0 && agora - cacheAgregado.timestamp < CACHE_TTL_MS) {
@@ -180,65 +188,60 @@ async function carregarTudo() {
   }
 
   const novosItens = [];
-  const categoriasDetectadas = new Set(CATEGORIAS_PRIORITARIAS);
+  const categoriasDetectadas = new Set();
   indiceOrigem.clear();
 
-  await Promise.all(
-    ADDONS_ORIGEM.map(async (addon) => {
-      const manifestOrigem = await fetchJsonSeguro(addon.manifestUrl);
-      if (!manifestOrigem || !Array.isArray(manifestOrigem.catalogs)) return;
+  for (const addon of ADDONS_ORIGEM) {
+    const manifestOrigem = await fetchJsonSeguro(addon.manifestUrl, 15000);
+    if (!manifestOrigem || !Array.isArray(manifestOrigem.catalogs)) {
+      console.log(`[Hub] Sem manifest ou catálogos: ${addon.nome}`);
+      continue;
+    }
 
-      for (const cat of manifestOrigem.catalogs) {
-        const catType = cat.type || "tv";
-        const catId = encodeURIComponent(cat.id);
-        const catalogUrl = construirUrlRecurso(
-          addon.manifestUrl,
-          `catalog/${catType}/${catId}.json`
-        );
+    for (const cat of manifestOrigem.catalogs) {
+      const { catType, metas } = await buscarMetasCatalogo(addon, cat);
 
-        const catalogData = await fetchJsonSeguro(catalogUrl);
-        const metas = catalogData && Array.isArray(catalogData.metas) ? catalogData.metas : [];
+      for (const meta of metas) {
+        if (!meta || !meta.id || !meta.name) continue;
 
-        for (const meta of metas) {
-          if (!meta || !meta.id || !meta.name) continue;
+        const categoriasItem = extrairCategoriasItem(meta, cat, addon);
+        categoriasItem.forEach((c) => categoriasDetectadas.add(c));
 
-          const categoriasItem = extrairCategoriasItem(meta, cat, addon);
-          categoriasItem.forEach((c) => categoriasDetectadas.add(c));
+        const compositeId = `agg:${encodeURIComponent(addon.nome)}:${encodeURIComponent(catType)}:${encodeURIComponent(meta.id)}`;
 
-          const compositeId = `agg:${encodeURIComponent(addon.nome)}:${encodeURIComponent(catType)}:${encodeURIComponent(meta.id)}`;
+        indiceOrigem.set(compositeId, {
+          manifestUrl: addon.manifestUrl,
+          type: catType,
+          originalId: meta.id
+        });
 
-          indiceOrigem.set(compositeId, {
-            manifestUrl: addon.manifestUrl,
-            type: catType,
-            originalId: meta.id
-          });
-
-          novosItens.push({
-            id: compositeId,
-            type: "tv",
-            name: meta.name,
-            poster: meta.poster,
-            posterShape: meta.posterShape || "landscape",
-            background: meta.background,
-            logo: meta.logo,
-            description: meta.description
-              ? `${meta.description} • Fonte: ${addon.nome}`
-              : `Fonte: ${addon.nome}`,
-            genres: categoriasItem
-          });
-        }
+        novosItens.push({
+          id: compositeId,
+          type: "tv",
+          name: meta.name,
+          poster: meta.poster,
+          posterShape: meta.posterShape || "landscape",
+          background: meta.background,
+          logo: meta.logo,
+          description: meta.description
+            ? `${meta.description} • Fonte: ${addon.nome}`
+            : `Fonte: ${addon.nome}`,
+          genres: categoriasItem
+        });
       }
-    })
+    }
+  }
+
+  const ordenadas = Array.from(categoriasDetectadas).sort((a, b) =>
+    a.localeCompare(b, "pt-BR")
   );
 
-  const extrasOrdenadas = Array.from(categoriasDetectadas)
-    .filter((c) => !CATEGORIAS_PRIORITARIAS.includes(c))
-    .sort((a, b) => a.localeCompare(b, "pt-BR"));
+  console.log(`[Hub] Total carregado: ${novosItens.length} itens | Categorias: ${ordenadas.join(", ")}`);
 
   cacheAgregado = {
     timestamp: agora,
     itens: novosItens,
-    categorias: ["Todas", ...CATEGORIAS_PRIORITARIAS, ...extrasOrdenadas]
+    categorias: ["Todas", ...ordenadas]
   };
 
   return cacheAgregado;
@@ -246,9 +249,9 @@ async function carregarTudo() {
 
 const manifest = {
   id: "com.usuario.tv.hub.unificado.br",
-  version: "1.0.0",
+  version: "1.0.3",
   name: "Hub TV Unificado BR",
-  description: "Seus addons de TV reunidos em uma única lista por categorias.",
+  description: "Seus addons de TV reunidos em uma única lista com todas as categorias disponíveis.",
   resources: ["catalog", "stream"],
   types: ["tv"],
   catalogs: [
@@ -259,7 +262,23 @@ const manifest = {
       extra: [
         {
           name: "genre",
-          options: ["Todas", ...CATEGORIAS_PRIORITARIAS, "Infantil", "Documentários", "Música", "Rádios"],
+          options: [
+            "Todas",
+            "Filmes",
+            "Séries",
+            "Variedades",
+            "Esportes",
+            "Notícias",
+            "Infantil",
+            "Documentários",
+            "Música",
+            "Rádios",
+            "Canais Abertos",
+            "Entretenimento",
+            "Cultura",
+            "Religioso",
+            "Outros"
+          ],
           isRequired: false
         }
       ]
@@ -279,9 +298,13 @@ builder.defineCatalogHandler(async ({ type, extra }) => {
     return { metas: itens };
   }
 
+  const alvo = categoriaSelecionada.toLowerCase().trim();
+
   return {
     metas: itens.filter(
-      (item) => Array.isArray(item.genres) && item.genres.includes(categoriaSelecionada)
+      (item) =>
+        Array.isArray(item.genres) &&
+        item.genres.some((g) => String(g).toLowerCase().trim() === alvo)
     )
   };
 });
@@ -294,10 +317,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
   const streamUrl = construirUrlRecurso(
     origem.manifestUrl,
-    `stream/${origem.type}/${encodeURIComponent(origem.originalId)}.json`
+    `stream/${origem.type}/${encodeURIComponent(origem.originalId)}`
   );
 
-  const data = await fetchJsonSeguro(streamUrl);
+  const data = await fetchJsonSeguro(streamUrl, 15000);
   return { streams: data && Array.isArray(data.streams) ? data.streams : [] };
 });
 
